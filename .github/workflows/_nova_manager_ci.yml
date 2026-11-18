@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   build:
@@ -29,18 +30,32 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Android SDK components
+      - name: Android SDK inventory
         run: |
-          set -eux
+          set -x
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "SDK=$SDK"
-          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SM" ]; then SM="$(find "$SDK" -name sdkmanager -type f | head -n 1)"; fi
-          yes | "$SM" --licenses >/dev/null 2>&1 || true
-          "$SM" "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865" "platform-tools"
+          ls "$SDK" || true
+          ls "$SDK/platforms" || true
+          ls "$SDK/build-tools" || true
+          ls "$SDK/ndk" || true
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$SDK/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          NDK_DIR="$(ls -d "$SDK"/ndk/* 2>/dev/null | head -n1 || true)"
+          if [ -n "$NDK_DIR" ]; then echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"; fi
+
+      - name: Try install SDK components
+        continue-on-error: true
+        run: |
+          set -x
+          SDK="$ANDROID_SDK_ROOT"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SM" ]; then SM="$(find "$SDK" -name sdkmanager -type f 2>/dev/null | head -n 1)"; fi
+          echo "sdkmanager=$SM"
+          "$SM" --version || true
+          "$SM" "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865" || true
+          ls "$SDK/platforms" || true
+          ls "$SDK/ndk" || true
 
       - name: Rust target
         run: |
@@ -85,27 +100,26 @@ jobs:
         run: |
           set -eux
           ls -l "$GITHUB_WORKSPACE/manager/app/build/outputs/apk/release/"
-          CODE=$(sed -n 's/.*versionCode = ([0-9]*).*/\1/p' manager/app/build.gradle.kts | head -n1 || true)
           gh release create "nova-manager-ci-$GITHUB_RUN_ID" -R "$REPO" \
             --title "SukiSU Nova manager CI #$GITHUB_RUN_ID" \
-            --notes "Built from SukiSU-Nova/SukiSU-Nova main (commit $GITHUB_SHA) with ksud built from source (arm64). " \
+            --notes "Built from SukiSU-Nova/SukiSU-Nova main (commit $GITHUB_SHA) with ksud built from source (arm64)." \
             manager/app/build/outputs/apk/release/*.apk
 
-      - name: Commit status and logs
+      - name: Report status
         if: always()
+        env:
+          RUN_STATUS: ${{ job.status }}
         run: |
-          set -eux
+          set -x
           {
             echo "run_id=$GITHUB_RUN_ID"
             echo "sha=$GITHUB_SHA"
-            echo "--- ksud tail ---"
-            tail -n 80 logs-ksud.log 2>/dev/null || true
-            echo "--- gradle tail ---"
-            tail -n 150 logs-gradle.log 2>/dev/null || true
-          } > ci-nova-status.txt
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add -f ci-nova-status.txt logs-ksud.log logs-gradle.log || true
-          git commit -m "ci: nova manager status" || true
-          git pull --rebase -X theirs || true
-          git push || true
+            echo "status=$RUN_STATUS"
+            echo '--- ksud tail ---'
+            tail -n 100 logs-ksud.log 2>/dev/null || true
+            echo '--- gradle tail ---'
+            tail -n 200 logs-gradle.log 2>/dev/null || true
+          } > ci-nova-status.txt 2>&1
+          gh issue create -R "$REPO" \
+            --title "Nova CI run $GITHUB_RUN_ID ($RUN_STATUS)" \
+            --body-file ci-nova-status.txt || true
