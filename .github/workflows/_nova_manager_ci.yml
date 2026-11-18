@@ -1,6 +1,8 @@
 name: _nova_manager_ci
 
 # 在 fork 里用 GitHub 托管 runner 复现 SukiSU Nova 管理器的源码构建
+# 使用固定 keystore（manager_ci/nova-release.keystore.b64）签名，
+# 使内核 KSU_EXPECTED_HASH 可以稳定指向该证书。
 on:
   push:
     branches: [main]
@@ -10,7 +12,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 jobs:
   build:
@@ -19,7 +20,8 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
-      KEYSTORE_PASS: nova-ci-pass
+      KEYSTORE_PASS: NovaPersonal2026
+      EXPECTED_CERT_SHA256: 569252d484257f6893731da4049c06515df67fd1cac490e33f541bce716e2d88
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,12 +79,14 @@ jobs:
           cp -f target/aarch64-linux-android/release/ksud manager/app/src/main/jniLibs/arm64-v8a/libksud.so
           ls -l manager/app/src/main/jniLibs/arm64-v8a/
 
-      - name: Keystore
+      - name: Keystore (fixed)
         run: |
           set -eux
-          keytool -genkeypair -keystore "$GITHUB_WORKSPACE/key.jks" -storetype JKS \
-            -alias nova -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" -dname "CN=SukiSU Nova CI"
+          base64 -d manager_ci/nova-release.keystore.b64 > "$GITHUB_WORKSPACE/key.jks"
+          keytool -list -keystore "$GITHUB_WORKSPACE/key.jks" -storepass "$KEYSTORE_PASS" | head -n 5
+          keytool -exportcert -keystore "$GITHUB_WORKSPACE/key.jks" -storepass "$KEYSTORE_PASS" -alias nova -file "$GITHUB_WORKSPACE/cert.der"
+          sha256sum "$GITHUB_WORKSPACE/cert.der"
+          stat -c %s "$GITHUB_WORKSPACE/cert.der"
           {
             echo "KEYSTORE_FILE=$GITHUB_WORKSPACE/key.jks"
             echo "KEYSTORE_PASSWORD=$KEYSTORE_PASS"
@@ -96,30 +100,31 @@ jobs:
           cd manager
           ./gradlew --no-daemon assembleRelease 2>&1 | tee ../logs-gradle.log
 
+      - name: Verify signer cert matches kernel expectation
+        run: |
+          set -eux
+          APK=$(ls manager/app/build/outputs/apk/release/*.apk | head -n1)
+          echo "APK=$APK"
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner -type f | sort | tail -n1)
+          "$APKSIGNER" verify --print-certs "$APK" | tee certs.txt
+          grep -qi "${EXPECTED_CERT_SHA256}" certs.txt
+          echo "signer cert matches kernel expected hash"
+
       - name: Publish release
         run: |
           set -eux
-          ls -l "$GITHUB_WORKSPACE/manager/app/build/outputs/apk/release/"
-          gh release create "nova-manager-ci-$GITHUB_RUN_ID" -R "$REPO" \
-            --title "SukiSU Nova manager CI #$GITHUB_RUN_ID" \
-            --notes "Built from SukiSU-Nova/SukiSU-Nova main (commit $GITHUB_SHA) with ksud built from source (arm64)." \
+          gh release create "nova-manager-fixedkey-$GITHUB_RUN_ID" -R "$REPO" \
+            --title "SukiSU Nova manager (fixed key) #$GITHUB_RUN_ID" \
+            --notes "Built from SukiSU-Nova main ($GITHUB_SHA). Signed with fixed personal key; cert sha256 $EXPECTED_CERT_SHA256 (DER 803 bytes)." \
             manager/app/build/outputs/apk/release/*.apk
 
-      - name: Report status
+      - name: Upload build logs
         if: always()
-        env:
-          RUN_STATUS: ${{ job.status }}
-        run: |
-          set -x
-          {
-            echo "run_id=$GITHUB_RUN_ID"
-            echo "sha=$GITHUB_SHA"
-            echo "status=$RUN_STATUS"
-            echo '--- ksud tail ---'
-            tail -n 100 logs-ksud.log 2>/dev/null || true
-            echo '--- gradle tail ---'
-            tail -n 200 logs-gradle.log 2>/dev/null || true
-          } > ci-nova-status.txt 2>&1
-          gh issue create -R "$REPO" \
-            --title "Nova CI run $GITHUB_RUN_ID ($RUN_STATUS)" \
-            --body-file ci-nova-status.txt || true
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-ksud-gradle-${{ github.run_id }}
+          path: |
+            logs-ksud.log
+            logs-gradle.log
+            certs.txt
+          if-no-files-found: ignore
